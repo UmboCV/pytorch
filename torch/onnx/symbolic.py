@@ -457,6 +457,18 @@ def upsample_bilinear2d(g, input, output_size):
                 height_scale_f=h_scale, mode_s="bilinear")
 
 
+def stack(g, *tensors, dim):
+    return g.op("ATen", *tensors, operator_s = "stack", dim_i=dim)
+
+
+def nonzero(g, input):
+    return g.op("ATen", input, operator_s="nonzero")
+
+
+def round(g, input):
+    return g.op("ATen", input, operator_s="round")
+
+
 def gt(g, input, other):
     return g.op("Greater", input, _if_scalar_type_as(other, input), **_broadcast_if_scalar(other))
 
