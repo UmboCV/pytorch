@@ -1,14 +1,26 @@
 #include "ATen/ATen.h"
 #include "ATen/CPUApplyUtils.h"
+#include "ATen/Config.h"
 #include "ATen/Dispatch.h"
 #include "ATen/ExpandUtils.h"
 #include "ATen/NativeFunctions.h"
+#include "c10/util/Exception.h"
 
 #include "ATen/CPUGenerator.h"
 #include "ATen/CheckGenerator.h"
-#include "ATen/Generator.h"
+#include "ATen/core/Generator.h"
+#include "ATen/native/Distributions.h"
+#include "ATen/native/DispatchStub.h"
+#include "ATen/native/cpu/UnaryOpsKernel.h"
 
-#include "TH/THRandom.h"
+#include <type_traits>
+#include <functional>
+#include <assert.h>
+#include <cpuinfo.h>
+
+#include <TH/THRandom.h>
+#include "TH/THGenerator.hpp"
+#include "TH/THMath.h"
 
 namespace {
 /*
@@ -42,11 +54,6 @@ namespace {
  * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
-THGenerator* get_generator(at::Generator* gen) {
-  auto default_gen = &at::globalContext().defaultGenerator(at::Backend::CPU);
-  auto gen_ = at::check_generator<at::CPUGenerator>(gen, default_gen);
-  return gen_->generator;
-}
 
 int64_t sample_poisson(double lambda, THGenerator* generator) {
   if (lambda >= 10) {
@@ -98,118 +105,123 @@ int64_t sample_poisson(double lambda, THGenerator* generator) {
   }
 }
 
-// TODO Replace this with more accurate digamma().
-template <typename scalar_t>
-scalar_t digamma_one(scalar_t x) {
-  const double eps = x * 1e-3;
-  return (std::lgamma(x + eps) - std::lgamma(x - eps)) / (eps + eps);
-}
-
-// Computes the reparameterized gradient -(d/dalpha cdf(x;alpha)) / pdf(x;alpha)
-// for random number x drawn from a standard Gamma distribution Gamma(alpha).
-template <typename scalar_t>
-scalar_t standard_gamma_grad_one(scalar_t alpha, scalar_t x) {
-  // Use a Taylor series expansion for small x.
-  if (x < 0.8f) {
-    scalar_t numer = 1;
-    scalar_t denom = alpha;
-    auto series1 = numer / denom;
-    auto series2 = numer / (denom * denom);
-    for (int i = 1; i <= 5; ++i) {
-      numer *= -x / i;
-      denom += 1;
-      series1 += numer / denom;
-      series2 += numer / (denom * denom);
-    }
-    const auto pow_x_alpha = std::pow(x, alpha);
-    const auto gamma_pdf = std::pow(x, alpha - 1) * std::exp(-x);
-    const auto gamma_cdf = pow_x_alpha * series1;
-    const auto gamma_cdf_alpha = (std::log(x) - digamma_one(alpha)) * gamma_cdf
-        - pow_x_alpha * series2;
-    const auto result = -gamma_cdf_alpha / gamma_pdf;
-    return std::isnan(result) ? 0 : result;
-  }
-
-  // Use a Rice saddle point expansion for large alpha.
-  if (alpha > 8.0f) {
-    if (0.9f * alpha <= x && x <= 1.1f * alpha) {
-      const auto numer_1 = 1 + 24 * alpha * (1 + 12 * alpha);
-      const auto numer_2 = 1440 * (alpha * alpha) + 6 * x * (53 - 120 * x)
-          - 65 * x * x / alpha + alpha * (107 + 3600 * x);
-      const auto denom = 1244160 * (alpha * alpha) * (alpha * alpha);
-      return numer_1 * numer_2 / denom;
-    }
-    const auto denom = std::sqrt(8 * alpha);
-    const auto term2 = denom / (alpha - x);
-    const auto term3 = std::pow(x - alpha - alpha * std::log(x / alpha), -1.5f);
-    const auto term23 = (x < alpha) ? term2 - term3 : term2 + term3;
-    const auto term1 = std::log(x / alpha) * term23
-                     - std::sqrt(2 / alpha) * (alpha + x) / ((alpha - x) * (alpha - x));
-    const auto stirling = 1 + 1 / (12 * alpha) * (1 + 1 / (24 * alpha));
-    const auto numer = x * term1;
-    return -stirling * numer / denom;
-  }
-
-  // Use a bivariate rational approximation to the reparameterized gradient.
-  const auto u = std::log(x / alpha);
-  const auto v = std::log(alpha);
-  static const scalar_t coef_uv[3][8] = {
-    {0.16009398, -0.094634809, 0.025146376, -0.0030648343,
-     1, 0.32668115, 0.10406089, 0.0014179084},
-    {0.53487893, 0.1298071, 0.065735949, -0.0015649758,
-     0.16639465, 0.020070113, -0.0035938915, -0.00058392623},
-    {0.040121004, -0.0065914022, -0.0026286047, -0.0013441777,
-     0.017050642, -0.0021309326, 0.00085092367, -1.5247877e-07},
-  };
-  scalar_t coef_v[8];
-  for (int i = 0; i < 8; ++ i) {
-    coef_v[i] = coef_uv[0][i] + u * (coef_uv[1][i] + u * coef_uv[2][i]);
-  }
-  const auto p = coef_v[0] + v * (coef_v[1] + v * (coef_v[2] + v * coef_v[3]));
-  const auto q = coef_v[4] + v * (coef_v[5] + v * (coef_v[6] + v * coef_v[7]));
-  return std::exp(p / q);
-}
 } // namespace
 
 namespace at {
 namespace native {
-Tensor& bernoulli_(Tensor& self, const Tensor& p, Generator* generator) {
-  self.copy_(at::bernoulli(std::get<0>(expand_inplace(self, p)), generator));
+
+Tensor bernoulli(const Tensor& self, Generator* gen) {
+  return at::empty_like(self).bernoulli_(self, gen);
+}
+
+Tensor bernoulli(const Tensor& self, double p, Generator* gen) {
+  return at::empty_like(self).bernoulli_(p, gen);
+}
+
+Tensor& bernoulli_out(Tensor& result, const Tensor& self, Generator* gen) {
+  // result.resize_as_(self) requires self to have same dtype as result, so we
+  // use resize_ instead.
+  // TODO: Fix resize_as_. See pytorch/pytorch#11665.
+  return result.resize_(self.sizes()).bernoulli_(self, gen);
+}
+
+Tensor& bernoulli_tensor_cpu_(Tensor& self, const Tensor& p_, Generator* gen) {
+  AT_DISPATCH_ALL_TYPES(self.type(), "bernoulli_tensor_cpu_self_", [&] {
+    THGenerator* generator = get_generator(gen);
+    std::lock_guard<std::mutex> lock(generator->mutex);
+    using self_t = scalar_t;
+    if (p_.type().scalarType() == kDouble) {
+      auto p = std::get<0>(expand_inplace(self, p_.to(kCPU)));
+      CPU_tensor_apply2<self_t, double>(
+        self, p, [generator](self_t& ret_val, double& p_val) {
+          ret_val = static_cast<self_t>(THRandom_bernoulli(generator, p_val));
+        });
+    } else {
+      AT_DISPATCH_FLOATING_TYPES(p_.type(), "bernoulli_tensor_cpu_p_", [&] {
+        auto p = std::get<0>(expand_inplace(self, p_.to(kCPU)));
+        using p_t = scalar_t;
+        CPU_tensor_apply2<self_t, p_t>(
+          self, p, [generator](self_t& ret_val, p_t& p_val) {
+            ret_val = static_cast<self_t>(THRandom_bernoulliFloat(generator, static_cast<p_t>(p_val)));
+          });
+      });
+    }
+  });
   return self;
 }
 
-Tensor& bernoulli_(Tensor& self, double p, Generator* generator) {
-  Tensor probs = self.type().toScalarType(kDouble).tensor({}).fill_(p);
-  return native::bernoulli_(self, probs, generator);
+DEFINE_DISPATCH(bernoulli_mkl_stub);
+
+Tensor& bernoulli_scalar_cpu_(Tensor& self, double p, Generator* gen) {
+  AT_CHECK(0 <= p && p <= 1, "bernoulli_ expects p to be in [0, 1], but got p=", p);
+#if AT_MKL_ENABLED()
+  if (cpuinfo_initialize() && cpuinfo_vendor_intel == cpuinfo_get_processor(0)->core->vendor) {
+    bernoulli_mkl_stub(kCPU, self, p, gen);
+    return self;
+  }
+#endif
+  AT_DISPATCH_ALL_TYPES(self.type(), "bernoulli_scalar_cpu_", [&] {
+    THGenerator* generator = get_generator(gen);
+    std::lock_guard<std::mutex> lock(generator->mutex);
+    CPU_tensor_apply1<scalar_t>(
+        self, [generator, p](scalar_t& ret_val) {
+          ret_val = static_cast<scalar_t>(THRandom_bernoulli(generator, p));
+        });
+  });
+  return self;
 }
 
+
 Tensor _standard_gamma_grad_cpu(const Tensor& self, const Tensor& output) {
-  Tensor ret = self.type().tensor(self.sizes());
+  Tensor ret = at::empty(self.sizes(), self.options());
   AT_DISPATCH_FLOATING_TYPES(self.type(), "_standard_gamma_grad", [&] {
     CPU_tensor_apply3<scalar_t, scalar_t, scalar_t>(ret, self, output,
       [](scalar_t& ret_val, const scalar_t& self_val, const scalar_t &output_val) {
-         ret_val = standard_gamma_grad_one(self_val, output_val);
+        ret_val = standard_gamma_grad_one<scalar_t, double>(self_val, output_val);
       }
     );
   });
   return ret;
 }
 
-Tensor _standard_gamma_grad_cuda(const Tensor& self, const Tensor& output) {
-  runtime_error("_standard_gamma_grad is not implemented for CUDA types");
-}
+/*
+ * This section is a counterpart to Distributions.cu
+ */
 
 Tensor _s_poisson_cpu(const Tensor& lambda, Generator *gen) {
-  Tensor ret = at::zeros(lambda.type(), lambda.sizes());
-  auto lambda_ = lambda.toType(ScalarType::Double);
+  Tensor ret = at::zeros(lambda.sizes(), lambda.type());
   AT_DISPATCH_FLOATING_TYPES(ret.type(), "poisson", [&] {
     THGenerator* generator = get_generator(gen);
-    CPU_tensor_apply2<scalar_t, double>(ret, lambda_,
-      [generator](scalar_t& ret_val, const double& lambda){
-        ret_val = sample_poisson(lambda, generator);
+    std::lock_guard<std::mutex> lock(generator->mutex);
+    CPU_tensor_apply2<scalar_t, scalar_t>(ret, lambda,
+      [generator](scalar_t& ret_val, const scalar_t& lambda){
+        ret_val = static_cast<scalar_t>(sample_poisson(static_cast<double>(lambda), generator));
       }
     );
-  });
+    });
   return ret;
 }
+
+Tensor _s_gamma_cpu(const Tensor& alpha, Generator *gen) {
+  Tensor ret = at::zeros(alpha.sizes(), alpha.type());
+  AT_DISPATCH_FLOATING_TYPES(ret.type(), "gamma", [&] {
+    THGenerator* generator = get_generator(gen);
+    std::lock_guard<std::mutex> lock(generator->mutex);
+    CPU_tensor_apply2<scalar_t, scalar_t>(ret, alpha,
+      [generator](scalar_t& ret_val, const scalar_t& alpha){
+        BaseSampler<double> standard_uniform([generator] () {
+          return THRandom_standard_uniform(generator);
+        });
+        BaseSampler<double> standard_normal([generator] () {
+          return THRandom_normal(generator, 0.0, 1.0);
+        });
+        auto sample = sample_gamma<scalar_t, double>(alpha, standard_uniform, standard_normal);
+        ret_val = std::max(std::numeric_limits<scalar_t>::min(), (scalar_t) sample);
+      }
+    );
+    });
+
+  return ret;
+}
+
 }} // namespace at::native

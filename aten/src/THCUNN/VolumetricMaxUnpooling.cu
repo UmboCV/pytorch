@@ -1,9 +1,10 @@
 #include "THCUNN.h"
+#include "THCTensor.hpp"
 #include "common.h"
 #include "THCDeviceTensor.cuh"
 #include "THCDeviceTensorUtils.cuh"
 #include "THCDeviceUtils.cuh"
-#include "THCHalf.h"
+#include "TH/THHalf.h"
 #include "THCHalfAutoNumerics.cuh"
 
 #include <cfloat>

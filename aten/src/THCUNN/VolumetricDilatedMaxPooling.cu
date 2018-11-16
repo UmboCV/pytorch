@@ -1,9 +1,10 @@
 #include "THCUNN.h"
+#include "THCTensor.hpp"
 #include "common.h"
 #include "THCDeviceTensor.cuh"
 #include "THCDeviceTensorUtils.cuh"
 #include "THCDeviceUtils.cuh"
-#include "THCHalf.h"
+#include "TH/THHalf.h"
 #include "THCHalfAutoNumerics.cuh"
 #include "THCAtomics.cuh"
 
@@ -56,7 +57,7 @@ __global__ void cuda_VolumetricDilatedMaxPooling_updateOutput(
           index = t * inputH * inputW + h * inputW + w;
           Dtype val = inputData[index];
 
-          if (max < val)
+          if ((max < val) || THCNumerics<Dtype>::isnan(val))
           {
             max = val;
             maxIndex = index;
